@@ -1,8 +1,6 @@
 import sys
 import cv2
 import numpy as np
-from skimage.metrics import peak_signal_noise_ratio as compare_psnr
-from skimage.metrics import structural_similarity as compare_ssim
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                              QHBoxLayout, QFileDialog, QWidget, QMenuBar, QAction, QGridLayout)
 from PyQt5.QtGui import QPixmap, QImage
@@ -13,6 +11,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from scipy.ndimage import gaussian_filter1d
 import pandas as pd
 from datetime import datetime
+import traceback
 
 # Define a function to compute the dark channel of the image
 def DarkChannel(im, sz):
@@ -79,39 +78,348 @@ def Recover(im, t, A, tx=0.1):
     res = np.clip(res, 0, 1)  # Clip pixel values to [0, 1]
     return res
 
-# Enhance the image by applying dehazing, detail enhancement, and filtering
-def enhance_image(file_path, target_size=(500, 500)):
-    src = cv2.imread(file_path)  # Load the input image
+def enhance_image(file_path, target_size=None):
+    """
+    Enhance an overexposed BGR image.
+
+    Parameters
+    ----------
+    file_path : str
+        Input image path.
+
+    target_size : tuple or None
+        Maximum (width, height). Use None to retain full resolution.
+        The GUI should resize only the displayed QPixmap.
+
+    Returns
+    -------
+    original_image, enhanced_image : numpy.ndarray
+        Original/working image and enhanced BGR image.
+    """
+
+    src = cv2.imread(file_path, cv2.IMREAD_COLOR)
+
     if src is None:
-        raise FileNotFoundError(f"Image file '{file_path}' not found or could not be loaded.")
-    h, w = src.shape[:2]  # Get original dimensions
-    scale_factor = min(target_size[1] / h, target_size[0] / w)  # Calculate scaling factor
-    new_size = (int(w * scale_factor), int(h * scale_factor))  # Compute new dimensions
-    resized_src = cv2.resize(src, new_size, interpolation=cv2.INTER_AREA)  # Resize the image
-    I = resized_src.astype('float64') / 255  # Normalize image to [0, 1]
+        raise FileNotFoundError(
+            f"Image file '{file_path}' could not be loaded."
+        )
 
-    # Dehazing process
-    dark = DarkChannel(I, 15)  # Compute dark channel
-    A = AtmLight(I, dark)  # Estimate atmospheric light
-    te = TransmissionEstimate(I, A, 15)  # Estimate transmission map
-    t = TransmissionRefine(resized_src, te)  # Refine transmission map
-    J = Recover(I, t, A, 0.1)  # Recover dehazed image
-    J = (J * 255).astype('uint8')  # Convert to 8-bit image
+    # ---------------------------------------------------------
+    # 1. Preserve maximum available resolution
+    # ---------------------------------------------------------
+    if target_size is not None:
+        height, width = src.shape[:2]
 
-    # Apply additional enhancements
-    filtered_image = cv2.bilateralFilter(J, d=2, sigmaColor=80, sigmaSpace=80)  # Bilateral filter
-    denoised_image = cv2.fastNlMeansDenoisingColored(filtered_image, None, 3, 3, 7, 15)  # Denoising
-    blended_image = cv2.addWeighted(filtered_image, 0.9, denoised_image, 0.1, 0)  # Blending
+        scale = min(
+            target_size[0] / width,
+            target_size[1] / height,
+            1.0
+        )
 
-    # Extract fine details
-    detail_layer = cv2.subtract(filtered_image, cv2.GaussianBlur(filtered_image, (5, 5), 2.0))  # Fine details
-    detail_layer = cv2.addWeighted(detail_layer, 1, blended_image, 1, 0)  # Blend with filtered image
+        if scale < 1.0:
+            new_size = (
+                max(1, round(width * scale)),
+                max(1, round(height * scale))
+            )
 
-    # Final sharpening
-    gaussian_blurred = cv2.GaussianBlur(detail_layer, (7, 7), 1.5)  # Gaussian blur for unsharp masking
-    enhanced_image = cv2.addWeighted(detail_layer, 1.5, gaussian_blurred, -0.5, 0)  # Unsharp masking
+            working_image = cv2.resize(
+                src,
+                new_size,
+                interpolation=cv2.INTER_AREA
+            )
+        else:
+            working_image = src.copy()
+    else:
+        working_image = src.copy()
 
-    return resized_src, enhanced_image  # Return original and enhanced images
+    # Convert to floating point.
+    image_float = (
+        working_image.astype(np.float32) / 255.0
+    )
+
+    # ---------------------------------------------------------
+    # 2. Detect partially and completely clipped highlights
+    # ---------------------------------------------------------
+    maximum_channel = np.max(image_float, axis=2)
+    minimum_channel = np.min(image_float, axis=2)
+
+    # Partially overexposed: at least one channel is near clipping.
+    highlight_mask = np.clip(
+        (maximum_channel - 0.72) / 0.28,
+        0.0,
+        1.0
+    )
+
+    # Smoothstep produces gradual transitions.
+    highlight_mask = (
+        highlight_mask
+        * highlight_mask
+        * (3.0 - 2.0 * highlight_mask)
+    )
+
+    highlight_mask = cv2.GaussianBlur(
+        highlight_mask,
+        (0, 0),
+        sigmaX=3.0
+    )
+
+    # Fully clipped pixels contain almost no useful channel data.
+    fully_clipped_mask = np.uint8(
+        (minimum_channel >= 0.985) * 255
+    )
+
+    # Remove isolated clipping-mask noise.
+    clipping_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (3, 3)
+    )
+
+    fully_clipped_mask = cv2.morphologyEx(
+        fully_clipped_mask,
+        cv2.MORPH_OPEN,
+        clipping_kernel
+    )
+
+    fully_clipped_mask = cv2.dilate(
+        fully_clipped_mask,
+        clipping_kernel,
+        iterations=1
+    )
+
+    # ---------------------------------------------------------
+    # 3. Gentle denoising
+    # ---------------------------------------------------------
+    denoised = cv2.fastNlMeansDenoisingColored(
+        working_image,
+        None,
+        h=2,
+        hColor=3,
+        templateWindowSize=7,
+        searchWindowSize=21
+    )
+
+    # ---------------------------------------------------------
+    # 4. Separate luminance from colour
+    # ---------------------------------------------------------
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+    luminance, channel_a, channel_b = cv2.split(lab)
+
+    luminance_float = (
+        luminance.astype(np.float32) / 255.0
+    )
+
+    # ---------------------------------------------------------
+    # 5. Correct overall exposure using image statistics
+    # ---------------------------------------------------------
+    percentile_95 = float(
+        np.percentile(luminance_float, 95)
+    )
+
+    if percentile_95 > 1e-6:
+        exposure_scale = float(
+            np.clip(
+                0.88 / percentile_95,
+                0.68,
+                1.0
+            )
+        )
+    else:
+        exposure_scale = 1.0
+
+    exposed_luminance = np.clip(
+        luminance_float * exposure_scale,
+        0.0,
+        1.0
+    )
+
+    # ---------------------------------------------------------
+    # 6. Highlight compression
+    # ---------------------------------------------------------
+    # This curve compresses highlights without flattening shadows.
+    compression_strength = 2.2
+
+    compressed_luminance = (
+        exposed_luminance
+        / (
+            exposed_luminance
+            + compression_strength
+            * (1.0 - exposed_luminance)
+            + 1e-6
+        )
+    )
+
+    # Normalize the tone curve.
+    white_value = 1.0 / (
+        1.0
+        + compression_strength * (1.0 - 1.0)
+    )
+
+    compressed_luminance /= white_value
+
+    # Apply compression mainly to highlights.
+    recovered_luminance = (
+        exposed_luminance * (1.0 - highlight_mask)
+        + compressed_luminance * highlight_mask
+    )
+
+    # Gently darken bright midtones.
+    recovered_luminance = np.power(
+        np.clip(recovered_luminance, 0.0, 1.0),
+        1.06
+    )
+
+    recovered_luminance_u8 = np.uint8(
+        np.clip(
+            recovered_luminance * 255.0,
+            0,
+            255
+        )
+    )
+
+    # ---------------------------------------------------------
+    # 7. Recover local contrast
+    # ---------------------------------------------------------
+    clahe = cv2.createCLAHE(
+        clipLimit=1.5,
+        tileGridSize=(8, 8)
+    )
+
+    clahe_luminance = clahe.apply(
+        recovered_luminance_u8
+    )
+
+    # Reduce CLAHE strength in the brightest regions to avoid noise.
+    clahe_strength = (
+        0.60 - 0.35 * highlight_mask
+    ).astype(np.float32)
+
+    local_contrast = (
+        recovered_luminance_u8.astype(np.float32)
+        * (1.0 - clahe_strength)
+        + clahe_luminance.astype(np.float32)
+        * clahe_strength
+    )
+
+    # ---------------------------------------------------------
+    # 8. Multi-scale detail enhancement
+    # ---------------------------------------------------------
+    fine_base = cv2.GaussianBlur(
+        local_contrast,
+        (0, 0),
+        sigmaX=0.8
+    )
+
+    medium_base = cv2.GaussianBlur(
+        local_contrast,
+        (0, 0),
+        sigmaX=2.0
+    )
+
+    large_base = cv2.bilateralFilter(
+        np.uint8(np.clip(local_contrast, 0, 255)),
+        d=9,
+        sigmaColor=25,
+        sigmaSpace=25
+    ).astype(np.float32)
+
+    fine_detail = local_contrast - fine_base
+    medium_detail = fine_base - medium_base
+    structural_detail = medium_base - large_base
+
+    # Symmetrical clipping preserves positive and negative edges.
+    fine_detail = np.clip(fine_detail, -6.0, 6.0)
+    medium_detail = np.clip(medium_detail, -10.0, 10.0)
+    structural_detail = np.clip(
+        structural_detail,
+        -14.0,
+        14.0
+    )
+
+    # Do not strongly sharpen unreliable clipped pixels.
+    reliable_detail_mask = (
+        1.0 - 0.80 * highlight_mask
+    )
+
+    clipped_float = (
+        fully_clipped_mask.astype(np.float32) / 255.0
+    )
+
+    reliable_detail_mask *= (
+        1.0 - 0.90 * clipped_float
+    )
+
+    detailed_luminance = (
+        large_base
+        + 1.05 * structural_detail * reliable_detail_mask
+        + 1.10 * medium_detail * reliable_detail_mask
+        + 0.85 * fine_detail * reliable_detail_mask
+    )
+
+    detailed_luminance = np.uint8(
+        np.clip(detailed_luminance, 0, 255)
+    )
+
+    # ---------------------------------------------------------
+    # 9. Reconstruct plausible colour in fully clipped areas
+    # ---------------------------------------------------------
+    if np.any(fully_clipped_mask):
+        channel_a = cv2.inpaint(
+            channel_a,
+            fully_clipped_mask,
+            3,
+            cv2.INPAINT_TELEA
+        )
+
+        channel_b = cv2.inpaint(
+            channel_b,
+            fully_clipped_mask,
+            3,
+            cv2.INPAINT_TELEA
+        )
+
+    enhanced_lab = cv2.merge(
+        (
+            detailed_luminance,
+            channel_a,
+            channel_b
+        )
+    )
+
+    enhanced_image = cv2.cvtColor(
+        enhanced_lab,
+        cv2.COLOR_LAB2BGR
+    )
+
+    # ---------------------------------------------------------
+    # 10. Natural colour and final edge-preserving cleanup
+    # ---------------------------------------------------------
+    hsv = cv2.cvtColor(
+        enhanced_image,
+        cv2.COLOR_BGR2HSV
+    ).astype(np.float32)
+
+    # Mild saturation improvement only.
+    hsv[:, :, 1] *= 1.04
+    hsv[:, :, 1] = np.clip(
+        hsv[:, :, 1],
+        0,
+        255
+    )
+
+    enhanced_image = cv2.cvtColor(
+        hsv.astype(np.uint8),
+        cv2.COLOR_HSV2BGR
+    )
+
+    enhanced_image = cv2.bilateralFilter(
+        enhanced_image,
+        d=5,
+        sigmaColor=10,
+        sigmaSpace=10
+    )
+
+    return working_image, enhanced_image
+
 
 # Function to calculate image entropy
 def calculate_entropy(image):
@@ -132,25 +440,17 @@ def calculate_colorfulness(image):
     colorfulness = np.sqrt((std_rg ** 2) + (std_yb ** 2)) + 0.3 * np.sqrt((mean_rg ** 2) + (mean_yb ** 2))  # Compute colorfulness
     return colorfulness
 
-def calculate_metrics(ground_truth, original, enhanced):
-    # Convert images to grayscale for PSNR and SSIM evaluation
-    ground_truth_gray = cv2.cvtColor(ground_truth, cv2.COLOR_BGR2GRAY)
+def calculate_metrics(original, enhanced):
     original_gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
     enhanced_gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
 
-    # Calculate PSNR  for output image compared to ground truth
-    psnr = compare_psnr(ground_truth_gray, enhanced_gray)
-
-    # Calculate SSIM for output image compared to ground truth
-    ssim = compare_ssim(ground_truth_gray, enhanced_gray)
-    
     entropy_original = calculate_entropy(original_gray)  # Compute entropy for original
     entropy_enhanced = calculate_entropy(enhanced_gray)  # Compute entropy for enhanced
     
     colorfulness_original = calculate_colorfulness(original)  # Compute colorfulness for original
     colorfulness_enhanced = calculate_colorfulness(enhanced)  # Compute colorfulness for enhanced
 
-    return psnr, ssim, entropy_original, entropy_enhanced, colorfulness_original, colorfulness_enhanced
+    return entropy_original, entropy_enhanced, colorfulness_original, colorfulness_enhanced
 
 class ImageEnhancerApp(QMainWindow):
     def __init__(self):
@@ -171,26 +471,10 @@ class ImageEnhancerApp(QMainWindow):
         self.image_layout = QGridLayout()  # Changed to QGridLayout for flexibility
         self.status_layout = QVBoxLayout()
 
-        # Add logos and text to the header
-        self.logo_left = QLabel()
-        self.logo_left.setPixmap(QPixmap("C:/fypGibo/Logo UMS putih.png").scaled(400, 400, Qt.KeepAspectRatio))
-        self.logo_left.setAlignment(Qt.AlignCenter)
-
-        self.logo_right = QLabel()
-        self.logo_right.setPixmap(QPixmap("C:/fypGibo/logo mcg.png").scaled(400, 400, Qt.KeepAspectRatio))
-        self.logo_right.setAlignment(Qt.AlignCenter)
-
-        self.custom_text = QLabel("""DISEDIAKAN OLEH: GABRIEL DENNIS
-    DIPANTAU OLEH: PROF DR. ABDUULLAH BADE
-    TAJUK KAJIAN: Penambahbaikkan Kualiti Imej Berkeamatan 
-    Tinggi Tunggal Menggunakan DARK CHANNEL PRIOR(DCP)
-                                    """)
+        self.custom_text = QLabel("Overexposed Image Enhancement System")
         self.custom_text.setAlignment(Qt.AlignCenter)
-        self.custom_text.setStyleSheet("font-size: 16px; font-weight: bold;")
-
-        self.header_layout.addWidget(self.logo_left)
+        self.custom_text.setStyleSheet("font-size: 30px; font-weight: bold;")
         self.header_layout.addWidget(self.custom_text)
-        self.header_layout.addWidget(self.logo_right)
 
         # Image display area
         self.original_label = QLabel("Imej Input")
@@ -203,16 +487,6 @@ class ImageEnhancerApp(QMainWindow):
         self.enhanced_label.setStyleSheet("border: 3px solid green; color: black;")
         self.enhanced_label.setFixedSize(500, 380)
 
-        self.groundtruth_label = QLabel("Imej Rujukan")
-        self.groundtruth_label.setAlignment(Qt.AlignCenter)
-        self.groundtruth_label.setStyleSheet("border: 3px solid white; color: black;")
-        self.groundtruth_label.setFixedSize(500, 380)
-        
-        self.base_label = QLabel("Imej Dipulihkan Dengan Teknik DCP Asal")
-        self.base_label.setAlignment(Qt.AlignCenter)
-        self.base_label.setStyleSheet("border: 3px solid red; color: black;")
-        self.base_label.setFixedSize(500, 380)
-
         self.original_graph_canvas = FigureCanvas(plt.figure(figsize=(3, 2)))
         self.enhanced_graph_canvas = FigureCanvas(plt.figure(figsize=(3, 2)))
         
@@ -223,10 +497,8 @@ class ImageEnhancerApp(QMainWindow):
         # Arrange the image and graph canvases in a grid (rows, columns)
         self.image_layout.addWidget(self.original_label, 0, 0)
         self.image_layout.addWidget(self.original_graph_canvas, 0, 2)
-        self.image_layout.addWidget(self.enhanced_label, 0, 1)
+        self.image_layout.addWidget(self.enhanced_label, 1, 0)
         self.image_layout.addWidget(self.enhanced_graph_canvas, 1, 2)
-        self.image_layout.addWidget(self.groundtruth_label, 1, 0)
-        self.image_layout.addWidget(self.base_label, 1, 1)
 
         # Status label
         self.status_label = QLabel("Muat naik Imej untuk memaparkan metrik")
@@ -309,13 +581,9 @@ class ImageEnhancerApp(QMainWindow):
         options = QFileDialog.Options()
         
         file_path_1, _ = QFileDialog.getOpenFileName(self, "Buka Imej Input", "", "Images (*.png *.jpg *.jpeg *.bmp)", options=options)
-        file_path_2, _ = QFileDialog.getOpenFileName(self, "Buka Imej Rujukan", "", "Images (*.png *.jpg *.jpeg *.bmp)", options=options)
-        file_path_3, _ = QFileDialog.getOpenFileName(self, "Buka Imej Hasil DCP Asal", "", "Images (*.png *.jpg *.jpeg *.bmp)", options=options)
         
-        if file_path_1 and file_path_2:
+        if file_path_1:
             self.display_images(file_path_1)
-            self.display_groundtruth_image(file_path_2)
-            self.display_base(file_path_3)
         else:
             print("Sila pilih 3 file yang sesuai.")
             
@@ -337,13 +605,11 @@ class ImageEnhancerApp(QMainWindow):
             
     def save_metrics_to_excel(self, file_path, metrics):
         # Extract metrics
-        psnr, ssim, entropy_original, entropy_enhanced, colorfulness_original, colorfulness_enhanced = metrics
+        entropy_original, entropy_enhanced, colorfulness_original, colorfulness_enhanced = metrics
 
         # Create a dictionary for the current metrics
         metric_entry = {
             "Image Path": file_path,
-            "PSNR": psnr,
-            "SSIM": ssim,
             "Entropi Asal": entropy_original,
             "Entropi Pulih": entropy_enhanced,
             "CI Asal": colorfulness_original,
@@ -358,110 +624,58 @@ class ImageEnhancerApp(QMainWindow):
         df = pd.DataFrame(self.metrics_data)
 
         # Save the DataFrame to an Excel file
-        excel_file = "test.xlsx"
+        excel_file = "data.xlsx"
         df.to_excel(excel_file, index=False)
     
     def display_images(self, file_path):
         try:
-            # Enhance image (this function should return original and enhanced images)
             original_image, enhanced_image = enhance_image(file_path)
-            
-            # Display original and enhanced images
+
+            # Convert OpenCV images to QPixmap
             original_qpixmap = self.convert_cv_to_pixmap(original_image)
-            self.original_label.setPixmap(original_qpixmap)
-            self.original_label.setToolTip(f"Imej Input: {file_path}")  # Add file name as tooltip
-            
             enhanced_qpixmap = self.convert_cv_to_pixmap(enhanced_image)
+
+            # Scale images to fit their prepared label frames
+            original_qpixmap = original_qpixmap.scaled(
+                self.original_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+
+            enhanced_qpixmap = enhanced_qpixmap.scaled(
+                self.enhanced_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+
+            # Display images
+            self.original_label.setPixmap(original_qpixmap)
+            self.original_label.setToolTip(f"Imej Input: {file_path}")
+
             self.enhanced_label.setPixmap(enhanced_qpixmap)
-            self.enhanced_label.setToolTip(f"Imej Pulih: {file_path}")  # Add file name as tooltip
-            
-            # Load the ground truth image (assuming it's in the same directory with a specific naming convention)
-            ground_truth_path = file_path.replace(".jpg", "_gt.jpg")  # Adjust this based on your ground truth file naming
-            ground_truth_image = cv2.imread(ground_truth_path)
-            
-            if ground_truth_image is None:
-                raise FileNotFoundError(f"Imej rujukan '{ground_truth_path}' tidak dijumpai aau dimuat naik")
-            
-            # Resize the ground truth image to match the original image size
-            ground_truth_image = cv2.resize(ground_truth_image, (original_image.shape[1], original_image.shape[0]))
-            
-            # Display the ground truth image
-            ground_truth_qpixmap = self.convert_cv_to_pixmap(ground_truth_image)
-            self.groundtruth_label.setPixmap(ground_truth_qpixmap)
-            self.groundtruth_label.setToolTip(f"Imej Rujukan: {ground_truth_path}")  # Add file name as tooltip
-            
-            # Calculate and display metrics
+            self.enhanced_label.setToolTip(f"Imej Pulih: {file_path}")
+
+            # Keep the full processed image for saving
+            self.enhanced_image = enhanced_image.copy()
+
             metrics = calculate_metrics(
-                ground_truth_image, original_image, enhanced_image
+                original_image,
+                enhanced_image
             )
-            
-            # Update the status label with all metrics
+
             self.status_label.setText(
-                f"PSNR: {metrics[0]:.4f}   "
-                f"SSIM: {metrics[1]:.4f}   "
-                f"Entrofi Asal: {metrics[2]:.4f}, Entrofi Pulih: {metrics[3]:.4f}   "
-                f"CI Asal: {metrics[4]:.4f}, CI Pulih: {metrics[5]:.4f}   "
+                f"Entropi Asal: {metrics[0]:.4f}, "
+                f"Entropi Pulih: {metrics[1]:.4f}   "
+                f"CI Asal: {metrics[2]:.4f}, "
+                f"CI Pulih: {metrics[3]:.4f}"
             )
 
-            # Save metrics to Excel
             self.save_metrics_to_excel(file_path, metrics)
+            self.plot_noise_graph(original_image, enhanced_image)
+
         except Exception as e:
             self.status_label.setText(f"Ralat: {str(e)}")
-        
-        # Call plot_image_graph function to display the RGB histograms
-        self.plot_noise_graph(original_image, enhanced_image)
-
-    def display_groundtruth_image(self, file_path_2, target_size=(500, 500)):
-        try:
-            # Load ground truth image using OpenCV
-            groundtruth = cv2.imread(file_path_2)
-            if groundtruth is None:
-                raise FileNotFoundError(f"Fail imej '{file_path_2}' tidak dijumpai atau tidak dimuat naik")
-
-            # Resize the image while maintaining aspect ratio
-            h, w = groundtruth.shape[:2]
-            scale_factor = min(target_size[1] / h, target_size[0] / w)
-            new_size = (int(w * scale_factor), int(h * scale_factor))
-            groundtruth_image = cv2.resize(groundtruth, new_size, interpolation=cv2.INTER_AREA)
-
-            # Convert image to QPixmap
-            groundtruth_qpixmap = self.convert_cv_to_pixmap(groundtruth_image)
-            self.groundtruth_label.setPixmap(groundtruth_qpixmap)
-            self.groundtruth_label.setToolTip(f"Imej Rujukan: {file_path_2}")  # Add file name as tooltip
-
-            # Force UI update
-            self.groundtruth_label.repaint()
-
-            # Display file path as label
-            self.groundtruth_label.setToolTip(f"Imej Rujukan: {file_path_2}")
-        except Exception as e:
-            self.status_label.setText(f"Ralat: {str(e)}")
-            
-    def display_base(self, file_path_3, target_size=(500, 500)):
-        try:
-            # Load base DCP image using OpenCV
-            base = cv2.imread(file_path_3)
-            if base is None:
-                raise FileNotFoundError(f"Fail imej '{file_path_3}' tidak dijumpai atau dimuat naik.")
-
-            # Resize the image while maintaining aspect ratio
-            h, w = base.shape[:2]
-            scale_factor = min(target_size[1] / h, target_size[0] / w)
-            new_size = (int(w * scale_factor), int(h * scale_factor))
-            base_image = cv2.resize(base, new_size, interpolation=cv2.INTER_AREA)
-
-            # Convert image to QPixmap
-            base_qpixmap = self.convert_cv_to_pixmap(base_image)
-            self.base_label.setPixmap(base_qpixmap)
-            self.base_label.setToolTip(f"DCP Asal: {file_path_3}")  # Add file name as tooltip
-
-            # Force UI update
-            self.base_label.repaint()
-
-            # Display file path as label
-            self.base_label.setToolTip(f"DCP Asal: {file_path_3}")
-        except Exception as e:
-            self.status_label.setText(f"Ralat: {str(e)}")
+            print(f"Error in display_images: {e}")
         
     def convert_cv_to_pixmap(self, cv_img):
         height, width, channel = cv_img.shape
