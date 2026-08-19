@@ -1,475 +1,573 @@
-import sys
-import cv2
-import numpy as np
-from skimage.metrics import peak_signal_noise_ratio as compare_psnr
-from skimage.metrics import structural_similarity as compare_ssim
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
-                             QHBoxLayout, QFileDialog, QWidget, QMenuBar, QAction, QGridLayout)
-from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import Qt
 import math
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from scipy.ndimage import gaussian_filter1d
-import pandas as pd
+import sys
 from datetime import datetime
 
-# Define a function to compute the dark channel of the image
+import cv2
+import numpy as np
+import pandas as pd
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMenuBar,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+
 def DarkChannel(im, sz):
-    b, g, r = cv2.split(im)  # Split image into B, G, R channels
-    dc = cv2.min(cv2.min(r, g), b)  # Find the minimum across all channels
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (sz, sz))  # Create a morphological structuring element
-    dark = cv2.erode(dc, kernel)  # Apply erosion to get the dark channel
-    return dark
+    b, g, r = cv2.split(im)
+    dc = cv2.min(cv2.min(r, g), b)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (sz, sz))
+    return cv2.erode(dc, kernel)
 
-# Function to estimate atmospheric light from the dark channel
+
 def AtmLight(im, dark):
-    [h, w] = im.shape[:2]  # Get image dimensions
-    imsz = h * w  # Calculate total number of pixels
-    numpx = int(max(math.floor(imsz / 1000), 1))  # Select the top 0.1% brightest pixels
-    darkvec = dark.reshape(imsz)  # Flatten dark channel to a 1D array
-    imvec = im.reshape(imsz, 3)  # Flatten image to a 2D array (pixels x 3 channels)
-    indices = darkvec.argsort()  # Sort dark channel pixel intensities
-    indices = indices[imsz - numpx::]  # Select indices of the brightest pixels
-    atmsum = np.zeros([1, 3])  # Initialize the atmospheric light sum
-    for ind in range(1, numpx):  # Sum the RGB values of the brightest pixels
-        atmsum = atmsum + imvec[indices[ind]]
-    A = atmsum / numpx  # Compute average atmospheric light
-    return A / np.max(A)  # Normalize atmospheric light
+    h, w = im.shape[:2]
+    imsz = h * w
+    numpx = int(max(math.floor(imsz / 1000), 1))
+    darkvec = dark.reshape(imsz)
+    imvec = im.reshape(imsz, 3)
+    indices = darkvec.argsort()[imsz - numpx :]
+    atmsum = np.zeros((1, 3))
 
-# Estimate the transmission map using the atmospheric light and dark channel
-def TransmissionEstimate(im, A, sz):
-    omega = 0.95  # Parameter to control the amount of haze removal
-    im3 = np.empty(im.shape, im.dtype)  # Create an empty array of the same shape as input image
-    for ind in range(0, 3):
-        im3[:, :, ind] = im[:, :, ind] / A[0, ind]  # Normalize image channels by atmospheric light
-    transmission = 1 - omega * DarkChannel(im3, sz)  # Estimate transmission
-    return transmission
+    for ind in range(numpx):
+        atmsum += imvec[indices[ind]]
 
-# Perform guided filtering to refine the transmission map
+    atmospheric_light = atmsum / numpx
+    return atmospheric_light / max(float(np.max(atmospheric_light)), 1e-8)
+
+
+def TransmissionEstimate(im, atmospheric_light, sz):
+    omega = 0.95
+    normalized = np.empty(im.shape, im.dtype)
+    for ind in range(3):
+        normalized[:, :, ind] = im[:, :, ind] / max(
+            float(atmospheric_light[0, ind]), 1e-8
+        )
+    return 1 - omega * DarkChannel(normalized, sz)
+
+
 def Guidedfilter(im, p, r, eps):
-    mean_I = cv2.boxFilter(im, cv2.CV_64F, (r, r))  # Compute mean of input image
-    mean_p = cv2.boxFilter(p, cv2.CV_64F, (r, r))  # Compute mean of input guidance image
-    mean_Ip = cv2.boxFilter(im * p, cv2.CV_64F, (r, r))  # Compute mean of input image x guidance image
-    cov_Ip = mean_Ip - mean_I * mean_p  # Compute covariance of input and guidance image
-    mean_II = cv2.boxFilter(im * im, cv2.CV_64F, (r, r))  # Compute mean of input image squared
-    var_I = mean_II - mean_I * mean_I  # Compute variance of input image
-    a = cov_Ip / (var_I + eps)  # Calculate slope of the linear model
-    b = mean_p - a * mean_I  # Calculate intercept of the linear model
-    mean_a = cv2.boxFilter(a, cv2.CV_64F, (r, r))  # Smooth slope
-    mean_b = cv2.boxFilter(b, cv2.CV_64F, (r, r))  # Smooth intercept
-    q = mean_a * im + mean_b  # Compute the refined output
-    return q
+    mean_i = cv2.boxFilter(im, cv2.CV_64F, (r, r))
+    mean_p = cv2.boxFilter(p, cv2.CV_64F, (r, r))
+    mean_ip = cv2.boxFilter(im * p, cv2.CV_64F, (r, r))
+    covariance = mean_ip - mean_i * mean_p
+    mean_ii = cv2.boxFilter(im * im, cv2.CV_64F, (r, r))
+    variance = mean_ii - mean_i * mean_i
+    a = covariance / (variance + eps)
+    b = mean_p - a * mean_i
+    mean_a = cv2.boxFilter(a, cv2.CV_64F, (r, r))
+    mean_b = cv2.boxFilter(b, cv2.CV_64F, (r, r))
+    return mean_a * im + mean_b
 
-# Refine the transmission map using guided filtering
-def TransmissionRefine(im, et):
-    gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)  # Convert image to grayscale
-    gray = np.float64(gray) / 255  # Normalize grayscale values to [0, 1]
-    r = 60  # Radius for guided filter
-    eps = 0.0001  # Regularization parameter for guided filter
-    t = Guidedfilter(gray, et, r, eps)  # Apply guided filter
-    return t
 
-# Recover the final dehazed image
-def Recover(im, t, A, tx=0.1):
-    res = np.empty(im.shape, im.dtype)  # Create an empty array for the result
-    t = cv2.max(t, tx)  # Avoid division by zero by setting a lower limit for transmission
-    for ind in range(0, 3):
-        res[:, :, ind] = (im[:, :, ind] - A[0, ind]) / t + A[0, ind]  # Recover image for each channel
-    res = np.clip(res, 0, 1)  # Clip pixel values to [0, 1]
-    return res
+def TransmissionRefine(im, estimated_transmission):
+    gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float64) / 255
+    return Guidedfilter(gray, estimated_transmission, 60, 0.0001)
 
-# Enhance the image by applying dehazing, detail enhancement, and filtering
+
+def Recover(im, transmission, atmospheric_light, tx=0.1):
+    result = np.empty(im.shape, im.dtype)
+    transmission = cv2.max(transmission, tx)
+    for ind in range(3):
+        result[:, :, ind] = (
+            (im[:, :, ind] - atmospheric_light[0, ind]) / transmission
+            + atmospheric_light[0, ind]
+        )
+    return np.clip(result, 0, 1)
+
+
 def enhance_image(file_path, target_size=(500, 500)):
-    src = cv2.imread(file_path)  # Load the input image
-    if src is None:
-        raise FileNotFoundError(f"Image file '{file_path}' not found or could not be loaded.")
-    h, w = src.shape[:2]  # Get original dimensions
-    scale_factor = min(target_size[1] / h, target_size[0] / w)  # Calculate scaling factor
-    new_size = (int(w * scale_factor), int(h * scale_factor))  # Compute new dimensions
-    resized_src = cv2.resize(src, new_size, interpolation=cv2.INTER_AREA)  # Resize the image
-    I = resized_src.astype('float64') / 255  # Normalize image to [0, 1]
+    source = cv2.imread(file_path)
+    if source is None:
+        raise FileNotFoundError(
+            f"Image file '{file_path}' was not found or could not be loaded."
+        )
 
-    # Dehazing process
-    dark = DarkChannel(I, 15)  # Compute dark channel
-    A = AtmLight(I, dark)  # Estimate atmospheric light
-    te = TransmissionEstimate(I, A, 15)  # Estimate transmission map
-    t = TransmissionRefine(resized_src, te)  # Refine transmission map
-    J = Recover(I, t, A, 0.1)  # Recover dehazed image
-    J = (J * 255).astype('uint8')  # Convert to 8-bit image
+    height, width = source.shape[:2]
+    scale_factor = min(target_size[1] / height, target_size[0] / width)
+    new_size = (int(width * scale_factor), int(height * scale_factor))
+    resized_source = cv2.resize(source, new_size, interpolation=cv2.INTER_AREA)
+    normalized_source = resized_source.astype(np.float64) / 255
 
-    # Apply additional enhancements
-    filtered_image = cv2.bilateralFilter(J, d=2, sigmaColor=80, sigmaSpace=80)  # Bilateral filter
-    denoised_image = cv2.fastNlMeansDenoisingColored(filtered_image, None, 3, 3, 7, 15)  # Denoising
-    blended_image = cv2.addWeighted(filtered_image, 0.9, denoised_image, 0.1, 0)  # Blending
+    dark = DarkChannel(normalized_source, 15)
+    atmospheric_light = AtmLight(normalized_source, dark)
+    estimated_transmission = TransmissionEstimate(
+        normalized_source, atmospheric_light, 15
+    )
+    transmission = TransmissionRefine(resized_source, estimated_transmission)
+    recovered = Recover(
+        normalized_source, transmission, atmospheric_light, 0.1
+    )
+    recovered = (recovered * 255).astype(np.uint8)
 
-    # Extract fine details
-    detail_layer = cv2.subtract(filtered_image, cv2.GaussianBlur(filtered_image, (5, 5), 2.0))  # Fine details
-    detail_layer = cv2.addWeighted(detail_layer, 1, blended_image, 1, 0)  # Blend with filtered image
+    filtered = cv2.bilateralFilter(
+        recovered, d=2, sigmaColor=80, sigmaSpace=80
+    )
+    denoised = cv2.fastNlMeansDenoisingColored(
+        filtered, None, 3, 3, 7, 15
+    )
+    blended = cv2.addWeighted(filtered, 0.9, denoised, 0.1, 0)
+    detail = cv2.subtract(
+        filtered, cv2.GaussianBlur(filtered, (5, 5), 2.0)
+    )
+    detail = cv2.addWeighted(detail, 1, blended, 1, 0)
+    gaussian_blurred = cv2.GaussianBlur(detail, (7, 7), 1.5)
+    enhanced = cv2.addWeighted(detail, 1.5, gaussian_blurred, -0.5, 0)
 
-    # Final sharpening
-    gaussian_blurred = cv2.GaussianBlur(detail_layer, (7, 7), 1.5)  # Gaussian blur for unsharp masking
-    enhanced_image = cv2.addWeighted(detail_layer, 1.5, gaussian_blurred, -0.5, 0)  # Unsharp masking
+    return resized_source, enhanced
 
-    return resized_src, enhanced_image  # Return original and enhanced images
 
-# Function to calculate image entropy
 def calculate_entropy(image):
-    histogram, _ = np.histogram(image.flatten(), bins=256, range=(0, 256), density=True)  # Compute histogram
-    histogram = histogram[histogram > 0]  # Remove zero values
-    entropy = -np.sum(histogram * np.log2(histogram))  # Compute entropy
-    return entropy
+    histogram, _ = np.histogram(
+        image.flatten(), bins=256, range=(0, 256), density=True
+    )
+    histogram = histogram[histogram > 0]
+    return float(-np.sum(histogram * np.log2(histogram)))
 
-# Function to calculate colorfulness index
+
 def calculate_colorfulness(image):
-    (B, G, R) = cv2.split(image.astype("float"))  # Split into color channels
-    rg = R - G  # Compute red-green difference
-    yb = 0.5 * (R + G) - B  # Compute yellow-blue difference
-    std_rg = np.std(rg)  # Standard deviation of rg
-    std_yb = np.std(yb)  # Standard deviation of yb
-    mean_rg = np.mean(rg)  # Mean of rg
-    mean_yb = np.mean(yb)  # Mean of yb
-    colorfulness = np.sqrt((std_rg ** 2) + (std_yb ** 2)) + 0.3 * np.sqrt((mean_rg ** 2) + (mean_yb ** 2))  # Compute colorfulness
-    return colorfulness
+    blue, green, red = cv2.split(image.astype(float))
+    red_green = red - green
+    yellow_blue = 0.5 * (red + green) - blue
+    return float(
+        np.hypot(np.std(red_green), np.std(yellow_blue))
+        + 0.3 * np.hypot(np.mean(red_green), np.mean(yellow_blue))
+    )
 
-def calculate_metrics(ground_truth, original, enhanced):
-    # Convert images to grayscale for PSNR and SSIM evaluation
-    ground_truth_gray = cv2.cvtColor(ground_truth, cv2.COLOR_BGR2GRAY)
+
+def calculate_metrics(original, enhanced):
     original_gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
     enhanced_gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+    return (
+        calculate_entropy(original_gray),
+        calculate_entropy(enhanced_gray),
+        calculate_colorfulness(original),
+        calculate_colorfulness(enhanced),
+    )
 
-    # Calculate PSNR  for output image compared to ground truth
-    psnr = compare_psnr(ground_truth_gray, enhanced_gray)
-
-    # Calculate SSIM for output image compared to ground truth
-    ssim = compare_ssim(ground_truth_gray, enhanced_gray)
-    
-    entropy_original = calculate_entropy(original_gray)  # Compute entropy for original
-    entropy_enhanced = calculate_entropy(enhanced_gray)  # Compute entropy for enhanced
-    
-    colorfulness_original = calculate_colorfulness(original)  # Compute colorfulness for original
-    colorfulness_enhanced = calculate_colorfulness(enhanced)  # Compute colorfulness for enhanced
-
-    return psnr, ssim, entropy_original, entropy_enhanced, colorfulness_original, colorfulness_enhanced
 
 class ImageEnhancerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.metrics_data = []  # Initialize metrics_data as an empty list
+        self.metrics_data = []
+        self.enhanced_image = None
+        self.current_file_path = None
         self.initUI()
 
     def initUI(self):
         self.setWindowTitle("Sistem Pemulihan Imej")
-        self.setGeometry(100, 100, 1000, 800)
+        self.resize(1280, 780)
+        self.setMinimumSize(920, 640)
 
-        self.central_widget = QWidget()
-        self.central_widget.setStyleSheet("background-color: grey;")
-        self.setCentralWidget(self.central_widget)
+        central_widget = QWidget()
+        central_widget.setObjectName("centralWidget")
+        self.setCentralWidget(central_widget)
 
-        self.main_layout = QVBoxLayout(self.central_widget)
-        self.header_layout = QHBoxLayout()
-        self.image_layout = QGridLayout()  # Changed to QGridLayout for flexibility
-        self.status_layout = QVBoxLayout()
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(32, 26, 32, 24)
+        main_layout.setSpacing(22)
 
-        # Add logos and text to the header
-        self.logo_left = QLabel()
-        self.logo_left.setPixmap(QPixmap("C:/fypGibo/Logo UMS putih.png").scaled(400, 400, Qt.KeepAspectRatio))
-        self.logo_left.setAlignment(Qt.AlignCenter)
+        # Header and primary actions
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(16)
 
-        self.logo_right = QLabel()
-        self.logo_right.setPixmap(QPixmap("C:/fypGibo/logo mcg.png").scaled(400, 400, Qt.KeepAspectRatio))
-        self.logo_right.setAlignment(Qt.AlignCenter)
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(3)
+        eyebrow_label = QLabel("PEMULIHAN IMEJ DIGITAL")
+        eyebrow_label.setObjectName("eyebrowLabel")
+        title_label = QLabel("Sistem Pemulihan Imej")
+        title_label.setObjectName("titleLabel")
+        subtitle_label = QLabel(
+            "Pulihkan butiran dan tingkatkan kualiti imej berkeamatan tinggi."
+        )
+        subtitle_label.setObjectName("subtitleLabel")
+        title_layout.addWidget(eyebrow_label)
+        title_layout.addWidget(title_label)
+        title_layout.addWidget(subtitle_label)
 
-        self.custom_text = QLabel("""DISEDIAKAN OLEH: GABRIEL DENNIS
-    DIPANTAU OLEH: PROF DR. ABDUULLAH BADE
-    TAJUK KAJIAN: Penambahbaikkan Kualiti Imej Berkeamatan 
-    Tinggi Tunggal Menggunakan DARK CHANNEL PRIOR(DCP)
-                                    """)
-        self.custom_text.setAlignment(Qt.AlignCenter)
-        self.custom_text.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.load_button = QPushButton("Buka Imej Input")
+        self.load_button.setObjectName("secondaryButton")
+        self.load_button.setCursor(Qt.PointingHandCursor)
+        self.load_button.clicked.connect(self.load_image)
 
-        self.header_layout.addWidget(self.logo_left)
-        self.header_layout.addWidget(self.custom_text)
-        self.header_layout.addWidget(self.logo_right)
+        self.save_button = QPushButton("Simpan Imej Output")
+        self.save_button.setObjectName("primaryButton")
+        self.save_button.setCursor(Qt.PointingHandCursor)
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self.save_image)
 
-        # Image display area
-        self.original_label = QLabel("Imej Input")
-        self.original_label.setAlignment(Qt.AlignCenter)
-        self.original_label.setStyleSheet("border: 3px solid black; color: black;")
-        self.original_label.setFixedSize(500, 380)
+        header_layout.addLayout(title_layout)
+        header_layout.addStretch()
+        header_layout.addWidget(self.load_button)
+        header_layout.addWidget(self.save_button)
+        main_layout.addLayout(header_layout)
 
-        self.enhanced_label = QLabel("Imej Dipuihkan Dengan Teknik Integrasi 3 Teknik")
-        self.enhanced_label.setAlignment(Qt.AlignCenter)
-        self.enhanced_label.setStyleSheet("border: 3px solid green; color: black;")
-        self.enhanced_label.setFixedSize(500, 380)
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFrameShape(QFrame.HLine)
+        main_layout.addWidget(divider)
 
-        self.groundtruth_label = QLabel("Imej Rujukan")
-        self.groundtruth_label.setAlignment(Qt.AlignCenter)
-        self.groundtruth_label.setStyleSheet("border: 3px solid white; color: black;")
-        self.groundtruth_label.setFixedSize(500, 380)
-        
-        self.base_label = QLabel("Imej Dipulihkan Dengan Teknik DCP Asal")
-        self.base_label.setAlignment(Qt.AlignCenter)
-        self.base_label.setStyleSheet("border: 3px solid red; color: black;")
-        self.base_label.setFixedSize(500, 380)
+        # Reusable image card keeps the input and output visually consistent.
+        def create_image_card(step, title, description, accent):
+            card = QFrame()
+            card.setObjectName("imageCard")
+            card.setProperty("accent", accent)
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.original_graph_canvas = FigureCanvas(plt.figure(figsize=(3, 2)))
-        self.enhanced_graph_canvas = FigureCanvas(plt.figure(figsize=(3, 2)))
-        
-        # Set the fixed size for all canvases (in pixels)
-        self.original_graph_canvas.setFixedSize(500, 380)
-        self.enhanced_graph_canvas.setFixedSize(500, 380)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(20, 18, 20, 20)
+            card_layout.setSpacing(14)
 
-        # Arrange the image and graph canvases in a grid (rows, columns)
-        self.image_layout.addWidget(self.original_label, 0, 0)
-        self.image_layout.addWidget(self.original_graph_canvas, 0, 2)
-        self.image_layout.addWidget(self.enhanced_label, 0, 1)
-        self.image_layout.addWidget(self.enhanced_graph_canvas, 1, 2)
-        self.image_layout.addWidget(self.groundtruth_label, 1, 0)
-        self.image_layout.addWidget(self.base_label, 1, 1)
+            card_header = QHBoxLayout()
+            card_header.setSpacing(12)
 
-        # Status label
-        self.status_label = QLabel("Muat naik Imej untuk memaparkan metrik")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("font-size: 15px; background-color: black; color: white;")
+            card_title_layout = QVBoxLayout()
+            card_title_layout.setSpacing(2)
+            step_label = QLabel(step)
+            step_label.setObjectName("stepLabel")
+            card_title = QLabel(title)
+            card_title.setObjectName("cardTitle")
+            card_description = QLabel(description)
+            card_description.setObjectName("cardDescription")
+            card_title_layout.addWidget(step_label)
+            card_title_layout.addWidget(card_title)
+            card_title_layout.addWidget(card_description)
 
-        self.main_layout.addLayout(self.header_layout)
-        self.main_layout.addLayout(self.image_layout)
-        self.main_layout.addWidget(self.status_label)
+            state_badge = QLabel("MENUNGGU")
+            state_badge.setObjectName("stateBadge")
+            state_badge.setAlignment(Qt.AlignCenter)
 
-        # Menu bar
+            card_header.addLayout(card_title_layout)
+            card_header.addStretch()
+            card_header.addWidget(state_badge, 0, Qt.AlignTop)
+
+            image_label = QLabel()
+            image_label.setObjectName("imagePreview")
+            image_label.setAlignment(Qt.AlignCenter)
+            image_label.setMinimumSize(360, 360)
+            image_label.setSizePolicy(
+                QSizePolicy.Expanding, QSizePolicy.Expanding
+            )
+
+            card_layout.addLayout(card_header)
+            card_layout.addWidget(image_label, 1)
+            return card, image_label, state_badge
+
+        image_layout = QHBoxLayout()
+        image_layout.setSpacing(18)
+
+        input_card, self.original_label, self.input_badge = create_image_card(
+            "LANGKAH 01",
+            "Imej Input",
+            "Imej asal yang dipilih",
+            "input",
+        )
+        self.original_label.setText(
+            "Tiada imej dipilih\n\nKlik ‘Buka Imej Input’ untuk bermula"
+        )
+
+        output_card, self.enhanced_label, self.output_badge = create_image_card(
+            "LANGKAH 02",
+            "Imej Output",
+            "Hasil selepas proses pemulihan",
+            "output",
+        )
+        self.enhanced_label.setText(
+            "Hasil pemulihan akan dipaparkan di sini"
+        )
+
+        image_layout.addWidget(input_card, 1)
+        image_layout.addWidget(output_card, 1)
+        main_layout.addLayout(image_layout, 1)
+
+        # Persistent status area gives clear feedback without interrupting work.
+        status_frame = QFrame()
+        status_frame.setObjectName("statusFrame")
+        status_layout = QHBoxLayout(status_frame)
+        status_layout.setContentsMargins(16, 11, 16, 11)
+        status_layout.setSpacing(10)
+        status_dot = QLabel("●")
+        status_dot.setObjectName("statusDot")
+        self.status_label = QLabel("Muat naik imej untuk dipulihkan")
+        self.status_label.setObjectName("statusLabel")
+        status_tip = QLabel("PNG · JPG · JPEG · BMP")
+        status_tip.setObjectName("statusTip")
+        status_layout.addWidget(status_dot)
+        status_layout.addWidget(self.status_label)
+        status_layout.addStretch()
+        status_layout.addWidget(status_tip)
+        main_layout.addWidget(status_frame)
+
         menu_bar = QMenuBar(self)
+        self.setMenuBar(menu_bar)
         file_menu = menu_bar.addMenu("Fail")
 
-        load_action = QAction("Muat naik Imej", self)
-        load_action.triggered.connect(self.load_images)
-
-        #load_groundtruth_action = QAction("Load Ground Truth", self)
-        #load_groundtruth_action.triggered.connect(self.load_groundtruth)
-
-        save_action = QAction("Simpan Imej Pulih", self)
-        save_action.triggered.connect(self.save_image)
+        load_action = QAction("Muat naik Imej Input", self)
+        load_action.triggered.connect(self.load_image)
+        self.save_action = QAction("Simpan Imej Output", self)
+        self.save_action.setEnabled(False)
+        self.save_action.triggered.connect(self.save_image)
 
         file_menu.addAction(load_action)
-        #file_menu.addAction(load_groundtruth_action)
-        file_menu.addAction(save_action)
+        file_menu.addAction(self.save_action)
 
-    def plot_noise_graph(self, original_image, enhanced_image):
-        # Convert images to numpy arrays
-        original_image_np = np.array(original_image, dtype=np.float32)
-        enhanced_image_np = np.array(enhanced_image, dtype=np.float32)
+        self.setStyleSheet(
+            """
+            * {
+                font-family: "Segoe UI";
+                color: #E8ECF7;
+            }
+            QMainWindow, QWidget#centralWidget {
+                background-color: #0B1020;
+            }
+            QMenuBar {
+                background-color: #0B1020;
+                color: #AAB3CC;
+                padding: 5px 24px;
+                border-bottom: 1px solid #202A43;
+            }
+            QMenuBar::item {
+                padding: 6px 10px;
+                border-radius: 5px;
+            }
+            QMenuBar::item:selected, QMenu {
+                background-color: #182138;
+            }
+            QMenu {
+                border: 1px solid #2B3858;
+                padding: 5px;
+            }
+            QLabel#eyebrowLabel {
+                color: #7D8EFF;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 1px;
+            }
+            QLabel#titleLabel {
+                color: #FFFFFF;
+                font-size: 27px;
+                font-weight: 700;
+            }
+            QLabel#subtitleLabel {
+                color: #8792AE;
+                font-size: 12px;
+            }
+            QFrame#divider {
+                color: #202A43;
+                background-color: #202A43;
+                max-height: 1px;
+                border: none;
+            }
+            QPushButton {
+                min-height: 42px;
+                padding: 0 20px;
+                border-radius: 9px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton#primaryButton {
+                background-color: #6878F7;
+                color: white;
+                border: 1px solid #7C8AFF;
+            }
+            QPushButton#primaryButton:hover {
+                background-color: #7B89FF;
+            }
+            QPushButton#secondaryButton {
+                background-color: #151D31;
+                color: #DCE2F2;
+                border: 1px solid #2B3858;
+            }
+            QPushButton#secondaryButton:hover {
+                background-color: #1D2943;
+                border-color: #46577D;
+            }
+            QPushButton:disabled {
+                background-color: #20283A;
+                color: #626D87;
+                border-color: #29334A;
+            }
+            QFrame#imageCard {
+                background-color: #12192A;
+                border: 1px solid #26324C;
+                border-radius: 14px;
+            }
+            QFrame#imageCard[accent="output"] {
+                border-color: #2D564E;
+            }
+            QLabel#stepLabel {
+                color: #73809F;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QLabel#cardTitle {
+                color: #F7F9FF;
+                font-size: 17px;
+                font-weight: 650;
+            }
+            QLabel#cardDescription {
+                color: #7F8AA5;
+                font-size: 11px;
+            }
+            QLabel#stateBadge {
+                background-color: #202A41;
+                color: #93A0BE;
+                border: 1px solid #303C5A;
+                border-radius: 8px;
+                padding: 5px 9px;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QLabel#imagePreview {
+                background-color: #090E1A;
+                color: #68748F;
+                border: 1px dashed #35415F;
+                border-radius: 10px;
+                font-size: 12px;
+                padding: 12px;
+            }
+            QFrame#statusFrame {
+                background-color: #111829;
+                border: 1px solid #26314A;
+                border-radius: 10px;
+            }
+            QLabel#statusDot {
+                color: #4DD7A4;
+                font-size: 11px;
+            }
+            QLabel#statusLabel {
+                color: #AAB4CE;
+                font-size: 11px;
+            }
+            QLabel#statusTip {
+                color: #66728E;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QToolTip {
+                background-color: #182138;
+                color: white;
+                border: 1px solid #34415F;
+                padding: 6px;
+            }
+            """
+        )
 
-        # Compute noise (difference between original and enhanced images)
-        noise_image_np = original_image_np - enhanced_image_np
+    def load_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Buka Imej Input",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp)",
+        )
+        if file_path:
+            self.display_images(file_path)
 
-        # Colors for RGB channels
-        colors = ('r', 'g', 'b')
-
-        # Clear previous plots
-        self.original_graph_canvas.figure.clear()
-        self.enhanced_graph_canvas.figure.clear()
-
-        # Create new subplots
-        ax1 = self.original_graph_canvas.figure.add_subplot(111)
-        ax2 = self.enhanced_graph_canvas.figure.add_subplot(111)
-
-        # Plot noise frequency distribution
-        for i, color in enumerate(colors):
-            noise_values = original_image_np[..., i].ravel()
-            hist, bins = np.histogram(noise_values, bins=512, range=(-255, 255), density=True)
-            hist_smoothed = gaussian_filter1d(hist, sigma=2)
-            ax1.plot(bins[:-1], hist_smoothed, color=color, label=f'{color.upper()} Channel', linewidth=1.5, alpha=0.8)
-        
-        ax1.set_title('Frekuensi Hingar Imej Asal')
-        ax1.set_xlabel('Kekerapan Hingar')
-        ax1.set_ylabel('Frekuensi')
-        ax1.legend(loc='upper right')
-        ax1.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
-
-        # Plot noise frequency distribution for enhanced image (if needed)
-        for i, color in enumerate(colors):
-            noise_values = enhanced_image_np[..., i].ravel()
-            hist, bins = np.histogram(noise_values, bins=512, range=(-255, 255), density=True)
-            hist_smoothed = gaussian_filter1d(hist, sigma=2)
-            ax2.plot(bins[:-1], hist_smoothed, color=color, label=f'{color.upper()} Channel', linewidth=1.5, alpha=0.8)
-        
-        ax2.set_title('Frekuensi Hingar Imej Pulih')
-        ax2.set_xlabel('Kekerapan Hingar')
-        ax2.set_ylabel('Frekuensi')
-        ax2.legend(loc='upper right')
-        ax2.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
-
-        # Refresh the canvases
-        self.original_graph_canvas.draw()
-        self.enhanced_graph_canvas.draw()
-
-    def load_images(self):
-        self.original_graph_canvas.figure.clear()
-        self.enhanced_graph_canvas.figure.clear()
-        options = QFileDialog.Options()
-        
-        file_path_1, _ = QFileDialog.getOpenFileName(self, "Buka Imej Input", "", "Images (*.png *.jpg *.jpeg *.bmp)", options=options)
-        file_path_2, _ = QFileDialog.getOpenFileName(self, "Buka Imej Rujukan", "", "Images (*.png *.jpg *.jpeg *.bmp)", options=options)
-        file_path_3, _ = QFileDialog.getOpenFileName(self, "Buka Imej Hasil DCP Asal", "", "Images (*.png *.jpg *.jpeg *.bmp)", options=options)
-        
-        if file_path_1 and file_path_2:
-            self.display_images(file_path_1)
-            self.display_groundtruth_image(file_path_2)
-            self.display_base(file_path_3)
-        else:
-            print("Sila pilih 3 file yang sesuai.")
-            
-    def save_image(self):
-        if self.enhanced_label.pixmap() is not None:
-            save_path, _ = QFileDialog.getSaveFileName(
-                self, "Simpan Imej", "", "Images (*.png *.jpg *.jpeg *.bmp)"
-            )
-            if save_path:
-                # Capture the pixmap displayed in the enhanced_label
-                pixmap = self.enhanced_label.pixmap()
-                # Save the pixmap to the chosen file path
-                if pixmap.save(save_path):
-                    self.status_label.setText(f"Imej disimpan ke {save_path}.")
-                else:
-                    self.status_label.setText("Gagal menyimpan imej.")
-        else:
-            self.status_label.setText("Tiada imej pulih untuk disimpan.")
-            
-    def save_metrics_to_excel(self, file_path, metrics):
-        # Extract metrics
-        psnr, ssim, entropy_original, entropy_enhanced, colorfulness_original, colorfulness_enhanced = metrics
-
-        # Create a dictionary for the current metrics
-        metric_entry = {
-            "Image Path": file_path,
-            "PSNR": psnr,
-            "SSIM": ssim,
-            "Entropi Asal": entropy_original,
-            "Entropi Pulih": entropy_enhanced,
-            "CI Asal": colorfulness_original,
-            "CI Pulih": colorfulness_enhanced,
-            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-        # Append the metrics to the list
-        self.metrics_data.append(metric_entry)
-
-        # Convert the list to a DataFrame
-        df = pd.DataFrame(self.metrics_data)
-
-        # Save the DataFrame to an Excel file
-        excel_file = "test.xlsx"
-        df.to_excel(excel_file, index=False)
-    
     def display_images(self, file_path):
+        self.load_button.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.save_action.setEnabled(False)
+        self.input_badge.setText("MEMUAT")
+        self.output_badge.setText("MEMPROSES")
+        self.enhanced_label.clear()
+        self.enhanced_label.setText("Imej sedang dipulihkan…")
+        self.status_label.setText("Sedang memproses imej, sila tunggu…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+
         try:
-            # Enhance image (this function should return original and enhanced images)
             original_image, enhanced_image = enhance_image(file_path)
-            
-            # Display original and enhanced images
-            original_qpixmap = self.convert_cv_to_pixmap(original_image)
-            self.original_label.setPixmap(original_qpixmap)
-            self.original_label.setToolTip(f"Imej Input: {file_path}")  # Add file name as tooltip
-            
-            enhanced_qpixmap = self.convert_cv_to_pixmap(enhanced_image)
-            self.enhanced_label.setPixmap(enhanced_qpixmap)
-            self.enhanced_label.setToolTip(f"Imej Pulih: {file_path}")  # Add file name as tooltip
-            
-            # Load the ground truth image (assuming it's in the same directory with a specific naming convention)
-            ground_truth_path = file_path.replace(".jpg", "_gt.jpg")  # Adjust this based on your ground truth file naming
-            ground_truth_image = cv2.imread(ground_truth_path)
-            
-            if ground_truth_image is None:
-                raise FileNotFoundError(f"Imej rujukan '{ground_truth_path}' tidak dijumpai aau dimuat naik")
-            
-            # Resize the ground truth image to match the original image size
-            ground_truth_image = cv2.resize(ground_truth_image, (original_image.shape[1], original_image.shape[0]))
-            
-            # Display the ground truth image
-            ground_truth_qpixmap = self.convert_cv_to_pixmap(ground_truth_image)
-            self.groundtruth_label.setPixmap(ground_truth_qpixmap)
-            self.groundtruth_label.setToolTip(f"Imej Rujukan: {ground_truth_path}")  # Add file name as tooltip
-            
-            # Calculate and display metrics
-            metrics = calculate_metrics(
-                ground_truth_image, original_image, enhanced_image
+            self.current_file_path = file_path
+            self.enhanced_image = enhanced_image
+
+            self.original_label.setPixmap(
+                self.convert_cv_to_pixmap(original_image)
             )
-            
-            # Update the status label with all metrics
+            self.original_label.setToolTip(f"Imej Input: {file_path}")
+            self.enhanced_label.setPixmap(
+                self.convert_cv_to_pixmap(enhanced_image)
+            )
+            self.enhanced_label.setToolTip(f"Imej Output: {file_path}")
+            self.input_badge.setText("DIMUAT")
+            self.output_badge.setText("SIAP")
+            self.save_button.setEnabled(True)
+            self.save_action.setEnabled(True)
+
+            metrics = calculate_metrics(original_image, enhanced_image)
             self.status_label.setText(
-                f"PSNR: {metrics[0]:.4f}   "
-                f"SSIM: {metrics[1]:.4f}   "
-                f"Entrofi Asal: {metrics[2]:.4f}, Entrofi Pulih: {metrics[3]:.4f}   "
-                f"CI Asal: {metrics[4]:.4f}, CI Pulih: {metrics[5]:.4f}   "
+                f"Entropi Input: {metrics[0]:.4f}, "
+                f"Entropi Output: {metrics[1]:.4f}   "
+                f"CI Input: {metrics[2]:.4f}, "
+                f"CI Output: {metrics[3]:.4f}"
             )
-
-            # Save metrics to Excel
             self.save_metrics_to_excel(file_path, metrics)
-        except Exception as e:
-            self.status_label.setText(f"Ralat: {str(e)}")
-        
-        # Call plot_image_graph function to display the RGB histograms
-        self.plot_noise_graph(original_image, enhanced_image)
+        except Exception as error:
+            self.enhanced_image = None
+            self.input_badge.setText("RALAT")
+            self.output_badge.setText("GAGAL")
+            self.enhanced_label.clear()
+            self.enhanced_label.setText("Pemulihan imej tidak berjaya")
+            self.status_label.setText(f"Ralat: {error}")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.load_button.setEnabled(True)
 
-    def display_groundtruth_image(self, file_path_2, target_size=(500, 500)):
-        try:
-            # Load ground truth image using OpenCV
-            groundtruth = cv2.imread(file_path_2)
-            if groundtruth is None:
-                raise FileNotFoundError(f"Fail imej '{file_path_2}' tidak dijumpai atau tidak dimuat naik")
+    def save_image(self):
+        if self.enhanced_image is None:
+            self.status_label.setText("Tiada imej output untuk disimpan.")
+            return
 
-            # Resize the image while maintaining aspect ratio
-            h, w = groundtruth.shape[:2]
-            scale_factor = min(target_size[1] / h, target_size[0] / w)
-            new_size = (int(w * scale_factor), int(h * scale_factor))
-            groundtruth_image = cv2.resize(groundtruth, new_size, interpolation=cv2.INTER_AREA)
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Simpan Imej Output",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp)",
+        )
+        if not save_path:
+            return
 
-            # Convert image to QPixmap
-            groundtruth_qpixmap = self.convert_cv_to_pixmap(groundtruth_image)
-            self.groundtruth_label.setPixmap(groundtruth_qpixmap)
-            self.groundtruth_label.setToolTip(f"Imej Rujukan: {file_path_2}")  # Add file name as tooltip
+        if cv2.imwrite(save_path, self.enhanced_image):
+            self.status_label.setText(f"Imej disimpan ke {save_path}.")
+        else:
+            self.status_label.setText("Gagal menyimpan imej.")
 
-            # Force UI update
-            self.groundtruth_label.repaint()
+    def save_metrics_to_excel(self, file_path, metrics):
+        self.metrics_data.append(
+            {
+                "Image Path": file_path,
+                "Entropi Input": metrics[0],
+                "Entropi Output": metrics[1],
+                "CI Input": metrics[2],
+                "CI Output": metrics[3],
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+        pd.DataFrame(self.metrics_data).to_excel("test.xlsx", index=False)
 
-            # Display file path as label
-            self.groundtruth_label.setToolTip(f"Imej Rujukan: {file_path_2}")
-        except Exception as e:
-            self.status_label.setText(f"Ralat: {str(e)}")
-            
-    def display_base(self, file_path_3, target_size=(500, 500)):
-        try:
-            # Load base DCP image using OpenCV
-            base = cv2.imread(file_path_3)
-            if base is None:
-                raise FileNotFoundError(f"Fail imej '{file_path_3}' tidak dijumpai atau dimuat naik.")
-
-            # Resize the image while maintaining aspect ratio
-            h, w = base.shape[:2]
-            scale_factor = min(target_size[1] / h, target_size[0] / w)
-            new_size = (int(w * scale_factor), int(h * scale_factor))
-            base_image = cv2.resize(base, new_size, interpolation=cv2.INTER_AREA)
-
-            # Convert image to QPixmap
-            base_qpixmap = self.convert_cv_to_pixmap(base_image)
-            self.base_label.setPixmap(base_qpixmap)
-            self.base_label.setToolTip(f"DCP Asal: {file_path_3}")  # Add file name as tooltip
-
-            # Force UI update
-            self.base_label.repaint()
-
-            # Display file path as label
-            self.base_label.setToolTip(f"DCP Asal: {file_path_3}")
-        except Exception as e:
-            self.status_label.setText(f"Ralat: {str(e)}")
-        
     def convert_cv_to_pixmap(self, cv_img):
-        height, width, channel = cv_img.shape
+        height, width, _ = cv_img.shape
         bytes_per_line = 3 * width
-        q_image = QImage(cv_img.data, width, height, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
-        return QPixmap.fromImage(q_image)
+        q_image = QImage(
+            cv_img.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format_RGB888,
+        ).rgbSwapped()
+        return QPixmap.fromImage(q_image.copy())
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = ImageEnhancerApp()
     window.show()
